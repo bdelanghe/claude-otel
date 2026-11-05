@@ -38,7 +38,9 @@
             };
           };
           off = hm { };
-          wrapper = builtins.head on.launchd.agents.otelcol-claude.config.ProgramArguments;
+          noCaddy = hm { programs.claudeOtel = { enable = true; caddyAccessLog.path = null; }; };
+          wrapperOf = c: builtins.head c.launchd.agents.otelcol-claude.config.ProgramArguments;
+          wrapper = wrapperOf on;
           oo = builtins.head on.launchd.agents.openobserve.config.ProgramArguments;
         in
         {
@@ -54,6 +56,13 @@
               OO_TOKEN=x otelcol-contrib validate --config="$conf"
               for p in metrics logs traces; do yq -e ".service.pipelines.$p.exporters | contains([\"otlphttp/extra\"])" "$conf" >/dev/null; done
               ! yq -e '.service.pipelines["traces/browsing"].exporters | contains(["otlphttp/extra"])' "$conf" >/dev/null
+              # Caddy's log, in the logs pipeline only, as service `caddy`; and with no path, the config still validates and has no receiver.
+              yq -e '.service.pipelines.logs.receivers | contains(["filelog/caddy"])' "$conf" >/dev/null
+              yq -e '.receivers["filelog/caddy"].resource["service.name"] == "caddy"' "$conf" >/dev/null
+              ! yq -e '.service.pipelines.traces.receivers | contains(["filelog/caddy"])' "$conf" >/dev/null
+              noCaddyConf=$(grep -o '/nix/store/[^ ]*-otelcol-claude.yaml' ${wrapperOf noCaddy})
+              OO_TOKEN=x otelcol-contrib validate --config="$noCaddyConf"
+              ! grep -q 'filelog' "$noCaddyConf"
               grep -q 'ZO_DATA_RETENTION_DAYS=7' ${oo}
               grep -q 'ZO_HTTP_ADDR=127.0.0.1' ${oo}
               touch $out
