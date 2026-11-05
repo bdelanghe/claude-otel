@@ -8,9 +8,41 @@
 let
   cfg = config.programs.claudeOtel;
   extra = lib.concatMapStrings (n: n + ", ") cfg.extraExporterNames;
-  # extraExportersYaml is written at column 0; it sits under `exporters:`, two spaces in.
-  extraYaml = lib.optionalString (cfg.extraExportersYaml != "")
-    (lib.concatMapStrings (l: (if l == "" then "" else "  " + l) + "\n") (lib.splitString "\n" (lib.removeSuffix "\n" cfg.extraExportersYaml)));
+  # Fragments are written at column 0 and sit under a top-level key, two spaces in.
+  indent = text: lib.concatMapStrings (l: (if l == "" then "" else "  " + l) + "\n") (lib.splitString "\n" (lib.removeSuffix "\n" text));
+  extraYaml = lib.optionalString (cfg.extraExportersYaml != "") (indent cfg.extraExportersYaml);
+
+  # Caddy's access log, tailed as service `caddy`, so a request through the proxy can be found by trace ID. Caddy runs as root
+  # and writes the file; this collector runs as the user and reads it (bdelanghe/darwin proxy.nix, which makes it world-readable).
+  # Traefik's logs reach this collector by OTLP push from inside the Lima VM (--accesslog.otlp); this is the one file tailed here.
+  #
+  # The `traceparent` field is the W3C header, which Caddy logs as is; the trace parser puts its parts on the log record's own
+  # trace fields, and the regex leaves `trace_id` as an attribute too. A request without the header logs "" and is sent unparsed.
+  #
+  # start_at end, with no stored offset: lines written while the collector is down are not sent, though they stay in the file.
+  caddyReceiverName = "filelog/caddy";
+  caddyEnabled = cfg.caddyAccessLog.path != null;
+  caddyReceiver = lib.optionalString caddyEnabled (indent ''
+    ${caddyReceiverName}:
+      include: [ ${builtins.toJSON cfg.caddyAccessLog.path} ]
+      start_at: end
+      resource: { service.name: caddy }
+      operators:
+        - type: json_parser
+          timestamp: { parse_from: attributes.ts, layout_type: epoch, layout: s.us }
+          severity: { parse_from: attributes.level }
+        - type: regex_parser
+          if: 'attributes.traceparent matches "^00-"'
+          parse_from: attributes.traceparent
+          regex: '^00-(?P<trace_id>[0-9a-f]{32})-(?P<span_id>[0-9a-f]{16})-(?P<trace_flags>[0-9a-f]{2})$'
+          on_error: send_quiet
+          trace:
+            trace_id: { parse_from: attributes.trace_id }
+            span_id: { parse_from: attributes.span_id }
+            trace_flags: { parse_from: attributes.trace_flags }
+  '');
+  logsReceivers = lib.concatStringsSep ", " ([ "otlp" ] ++ lib.optional caddyEnabled caddyReceiverName);
+
   stateDir = "${config.home.homeDirectory}/.local/state";
   authFile = "${stateDir}/openobserve/auth.env";
 
@@ -31,6 +63,7 @@ let
         protocols:
           grpc: { endpoint: 127.0.0.1:4317 }
           http: { endpoint: 127.0.0.1:4318 }
+  '' + caddyReceiver + ''
     processors:
       memory_limiter: { check_interval: 1s, limit_mib: 256, spike_limit_mib: 64 }
       batch: { timeout: 5s }
@@ -86,7 +119,7 @@ let
           processors: [memory_limiter, batch]
           exporters: [otlphttp/openobserve, ${extra}file/metrics]
         logs:
-          receivers: [otlp]
+          receivers: [${logsReceivers}]
           processors: [memory_limiter, batch]
           exporters: [otlphttp/openobserve, ${extra}file/logs]
         traces:
@@ -175,6 +208,11 @@ in
     openobserve = {
       rootEmail = lib.mkOption { type = lib.types.str; default = "admin@localhost"; description = "Root user of the local OpenObserve (its password is generated once into ~/.local/state/openobserve/auth.env, 0600)."; };
       retentionDays = lib.mkOption { type = lib.types.ints.positive; default = 30; description = "Default stream retention (ZO_DATA_RETENTION_DAYS); the data is prompts, tool arguments, paths and URLs."; };
+    };
+    caddyAccessLog.path = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "/var/log/local-proxy-access.log";
+      description = "Caddy's JSON access log, tailed as service `caddy` with trace_id parsed from its `traceparent` field. A file that does not exist yet is picked up when it appears. null turns the receiver off.";
     };
     browsing.serviceName = lib.mkOption { type = lib.types.str; default = "focus-observer-tabs"; description = "service.name of the spans routed to the separate `browsing` stream."; };
     extraExportersYaml = lib.mkOption {
